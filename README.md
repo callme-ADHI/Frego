@@ -5,7 +5,7 @@
 ![Frego](https://img.shields.io/badge/ML-face--api.js-blue?style=flat-square)
 ![Stack](https://img.shields.io/badge/Stack-React%20%2B%20Vite-61dafb?style=flat-square)
 ![Privacy](https://img.shields.io/badge/Data-Client--Side%20Only-22c55e?style=flat-square)
-![License](https://img.shields.io/badge/License-MIT-purple?style=flat-square)
+
 
 ---
 
@@ -135,6 +135,4 @@ No server requests. No analytics. No cookies. Works offline after first load.
 
 ---
 
-## License
 
-MIT © 2026
