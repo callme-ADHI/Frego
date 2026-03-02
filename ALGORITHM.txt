@@ -1,0 +1,401 @@
+================================================================================
+  FREGO — Browser-Based Face Recognition Platform
+  ALGORITHM DOCUMENTATION  v1.0.0
+  Date: March 2026
+================================================================================
+
+  "Train on your photos. Test live on webcam. Everything runs in your browser."
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  1.  Overview & Design Philosophy
+  2.  System Architecture
+  3.  Phase 1 — Image Ingestion & Face Detection
+  4.  Phase 2 — Face Descriptor Extraction (Embedding Generation)
+  5.  Phase 3 — Training Algorithm
+       5a.  Centroid Computation
+       5b.  Adaptive Threshold (Leave-One-Out Nearest Neighbor)
+  6.  Phase 4 — Recognition Algorithm (Nearest-Neighbor Euclidean)
+  7.  Phase 5 — Temporal Smoothing
+  8.  Storage Architecture & Privacy Model
+  9.  Export Format
+  10. Threshold Guidelines & Tuning
+  11. Known Limitations
+
+================================================================================
+  1. OVERVIEW & DESIGN PHILOSOPHY
+================================================================================
+
+  Frego is a face recognition system that runs entirely in the web browser
+  using JavaScript / WebGL. There is no backend server, no cloud API, and no
+  network transmission of biometric data.
+
+  Core principles:
+    - All ML inference runs on GPU via WebGL (TensorFlow.js backend).
+    - Face images are NEVER persisted — processed in RAM and discarded.
+    - Only 128-dimensional embedding vectors are stored (cannot reconstruct images).
+    - One browser tab = one isolated session. Closing the tab clears session data.
+
+  The system is designed for single-identity recognition:
+    "Does the person in front of the camera match the trained identity?"
+
+================================================================================
+  2. SYSTEM ARCHITECTURE
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                       BROWSER (Client Only)                             │
+  │                                                                         │
+  │  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐            │
+  │  │  Upload  │──▶│  Train   │──▶│   Test   │──▶│ Download │            │
+  │  └──────────┘   └──────────┘   └──────────┘   └──────────┘            │
+  │       │               │               │               │                │
+  │       ▼               ▼               ▼               ▼                │
+  │  ┌─────────┐   ┌───────────┐   ┌───────────┐  ┌───────────┐           │
+  │  │ JS Heap │   │ IndexedDB │   │ IndexedDB │  │  .npy/.   │           │
+  │  │(images) │   │(model+    │   │ (read all │  │  json     │           │
+  │  │ + embs  │   │ embeddings│   │ embeddings│  │  export)  │           │
+  │  └─────────┘   └───────────┘   └───────────┘  └───────────┘           │
+  │                                                                         │
+  │  ML Models loaded from CDN (vladmandic/face-api):                      │
+  │    ├── ssd_mobilenetv1      → face detection                           │
+  │    ├── face_landmark_68     → 68-point landmark detection              │
+  │    └── face_recognition_net → 128D descriptor generation               │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  3. PHASE 1 — IMAGE INGESTION & FACE DETECTION
+================================================================================
+
+  INPUT:  JPG / JPEG / PNG image file(s) selected by the user
+  OUTPUT: Bounding box for the largest detected face
+
+  Step 1.1 — Load image into browser memory
+    - File is read via FileReader API → Object URL created
+    - HTMLImageElement created and loaded (stays in JS heap RAM only)
+    - Object URL is revoked immediately after load (image cannot be recovered)
+
+  Step 1.2 — Face Detection (SSD MobileNet v1)
+    - Model: ssdMobilenetv1 (Single Shot MultiBox Detector)
+    - Input: RGB HTMLImageElement
+    - Minimum confidence: 0.50 (images), 0.45 (video frames)
+    - Returns: bounding box [x, y, width, height] for each detected face
+
+  Step 1.3 — Face Selection
+    - If multiple faces detected → largest bounding box by area is selected
+    - If no face detected → image is skipped (reported to user)
+
+  Step 1.4 — Landmark Detection (faceLandmark68Net)
+    - 68 facial landmark points detected for alignment context
+    - Used internally by faceRecognitionNet to align the face region
+
+  Step 1.5 — Memory cleanup
+    - After embedding is extracted (Phase 2), the image element is dereferenced
+    - Garbage collector reclaims memory automatically
+
+================================================================================
+  4. PHASE 2 — FACE DESCRIPTOR EXTRACTION
+================================================================================
+
+  INPUT:  Detected + landmark-aligned face region
+  OUTPUT: 128-dimensional Float32Array descriptor
+
+  Step 2.1 — Face Descriptor Network (faceRecognitionNet)
+    Architecture: Modified ResNet-34 (based on dlib face recognition model)
+    Input:        Aligned face region (150×150 pixels internally)
+    Output:       128-dimensional Float32 vector
+
+    This is the same architecture used in:
+      - dlib's face_recognition_model_v1
+      - face_recognition Python library
+      - face-api.js (JavaScript port)
+
+    The network was pretrained on a large face dataset and produces descriptors
+    that are discriminative across identities.
+
+  Step 2.2 — Descriptor Properties
+    - Output dimension: exactly 128 floats
+    - Value range: approximately [-1.0, +1.0]
+    - The network output is NOT L2-normalized by the network itself
+    - Comparison metric: EUCLIDEAN DISTANCE (NOT cosine similarity)
+
+    IMPORTANT NOTE ON METRIC CHOICE:
+      - The prototype (Python/FaceNet) uses 512D L2-normalized embeddings
+        and compares via COSINE SIMILARITY / dot product.
+      - The browser version uses 128D embeddings from faceRecognitionNet
+        and MUST use EUCLIDEAN DISTANCE.
+      - face-api.js's own built-in FaceMatcher uses Euclidean distance.
+      - Using cosine similarity on these embeddings causes false positives
+        because all face embeddings cluster in a narrow angular band
+        (scores ~0.7–0.9 for ANY face, destroying discriminative power).
+
+  Step 2.3 — Descriptor storage (session memory)
+    - Each 128-float descriptor stored in JS heap via memoryStore.js
+    - Stored as: { modelId, embedding: Float32Array, timestamp }
+    - NOT written to IndexedDB, localStorage, or any disk storage at this stage
+
+================================================================================
+  5. PHASE 3 — TRAINING ALGORITHM
+================================================================================
+
+  INPUT:  N × 128D descriptors from session memory (N = number of valid faces)
+  OUTPUT: meanEmbedding (128D), allEmbeddings (N×128D), threshold (float)
+
+  ── 5a. CENTROID COMPUTATION ──────────────────────────────────────────────
+
+  The centroid (mean embedding) is the raw arithmetic average of all descriptors.
+  It is NOT L2-normalized (L2 normalization is appropriate for cosine space,
+  not Euclidean space).
+
+    mean[i] = (1/N) × Σ embedding[k][i]    for i = 0..127
+
+  The centroid serves two purposes:
+    1. Fallback matching when individual embeddings are unavailable
+    2. Export artifact (mean_embedding.npy) for use in other systems
+
+  ── 5b. ADAPTIVE THRESHOLD (LEAVE-ONE-OUT NEAREST NEIGHBOR) ──────────────
+
+  Goal: Find the tightest threshold that still accepts all training faces.
+
+  Algorithm:
+    For each training embedding eᵢ (i = 0..N-1):
+      Find its nearest neighbor eⱼ (j ≠ i) within the training set:
+        nn_dist[i] = min { euclidean(eᵢ, eⱼ) : j ≠ i }
+
+    max_nn_dist = max { nn_dist[i] : i = 0..N-1 }
+    raw         = max_nn_dist × SLACK          (SLACK = 1.25)
+    threshold   = clamp(raw, DIST_MIN, DIST_MAX)
+
+    Where:
+      DIST_MIN = 0.30   (never stricter than this — avoids excessive rejection)
+      DIST_MAX = 0.45   (never looser than this — individual recognition cap)
+
+  Rationale:
+    - max_nn_dist is the worst-case spread within the training set
+    - Multiplying by 1.25 adds slack for unseen lighting / angles
+    - Cap at 0.45 ensures we reject same-gender impostors
+      (face-api.js FaceMatcher default 0.60 is too loose for single-identity)
+
+  Complexity: O(N²) distance computations — fine for N ≤ 500
+
+  Self-validation:
+    After threshold is computed, each training embedding's nearest-neighbor
+    distance is checked against threshold. ≥90% passing is expected.
+
+  Result is saved to IndexedDB:
+    {
+      trained:       true,
+      meanEmbedding: float32[128],
+      allEmbeddings: float32[N][128],
+      threshold:     float (0.30 – 0.45),
+      trainedAt:     timestamp,
+      metricVersion: "euclidean_v1"
+    }
+
+================================================================================
+  6. PHASE 4 — RECOGNITION ALGORITHM (NEAREST-NEIGHBOR EUCLIDEAN)
+================================================================================
+
+  INPUT:  queryDescriptor (128D Float32Array from webcam frame)
+          modelData { allEmbeddings: float32[N][128], threshold: float }
+  OUTPUT: { distance: float, recognized: boolean }
+
+  Step 6.1 — Nearest-Neighbor Search
+    Compute Euclidean distance between the query and EVERY stored descriptor:
+
+      dist(a, b) = √( Σ (a[i] - b[i])² )  for i = 0..127
+
+      min_dist = min { dist(query, allEmbeddings[k]) : k = 0..N-1 }
+
+    This is identical to face-api.js FaceMatcher.findBestMatch() behavior.
+
+  Step 6.2 — Decision
+    recognized = (min_dist < threshold)
+
+    Concrete example:
+      threshold = 0.42
+      dist(your face, nearest training frame) = 0.21  → RECOGNIZED  ✓
+      dist(different male face, nearest)       = 0.54  → REJECTED    ✗
+      dist(female face, nearest)               = 0.78  → REJECTED    ✗
+
+  Step 6.3 — Why Nearest-Neighbor Beats Mean-Only
+    Mean-only comparison fails because:
+      - The centroid of 120 male-face embeddings sits ~0.40–0.50 from
+        the centroid of ANY other male's 120 embeddings.
+      - If threshold = 0.50, any similar-looking male passes. → False Positive
+
+    Nearest-neighbor wins because:
+      - Individual training embeddings span a tight cluster (radius ~0.15–0.25)
+      - A different person's face is ~0.50–0.80 from EACH of those frames
+      - The minimum distance still exceeds the threshold → Correctly rejected
+
+  Step 6.4 — Fallback (if allEmbeddings not available)
+    If only meanEmbedding is available (old model format or memory cleared):
+      dist = euclidean(query, meanEmbedding)
+      recognized = (dist < threshold × 0.85)   ← stricter scaling for mean-only
+
+================================================================================
+  7. PHASE 5 — TEMPORAL SMOOTHING
+================================================================================
+
+  Problem: Single-frame inference is noisy (motion blur, lighting flicker).
+  Solution: Rolling window over the last 5 frames — same approach used in
+            the Python prototype (recognize.py, deque(maxlen=5)).
+
+  State:
+    distHistory : float[]   — last 5 Euclidean distances
+    nameHistory : string[]  — last 5 identity labels
+
+  Per frame update:
+    1. Append current frame distance to distHistory (trim to last 5)
+    2. avgDist      = mean(distHistory)
+    3. framesBelow  = count(d < threshold for d in distHistory)
+    4. recognized   = (avgDist < threshold)
+                    AND (framesBelow ≥ len(distHistory) × 0.60)
+
+  The 60% majority rule prevents noise spikes from locking recognition.
+  A face must appear below threshold in ≥3 of 5 frames for a confirmed match.
+
+================================================================================
+  8. STORAGE ARCHITECTURE & PRIVACY MODEL
+================================================================================
+
+  ┌─────────────────────┬──────────────────────────────┬─────────────────┐
+  │  Data               │  Stored Where                │  Cleared When   │
+  ├─────────────────────┼──────────────────────────────┼─────────────────┤
+  │  Face images        │  NOWHERE (never persisted)   │  After extract  │
+  │  Session embeddings │  JS heap (memoryStore.js)    │  On tab close   │
+  │  Trained model      │  IndexedDB (frego_db v3)     │  User deletes   │
+  │  allEmbeddings      │  IndexedDB (with model)      │  User deletes   │
+  │  threshold          │  IndexedDB (with model)      │  User deletes   │
+  │  Webcam stream      │  Browser RAM (MediaStream)   │  Camera stopped │
+  │  Exported files     │  User's download folder      │  User's choice  │
+  └─────────────────────┴──────────────────────────────┴─────────────────┘
+
+  Privacy guarantee:
+    - 128D embedding vectors cannot be reverse-engineered to produce face images.
+    - No network requests are made with biometric data.
+    - No analytics, cookies, or tracking of any kind.
+    - Each user's IndexedDB is isolated to their browser profile.
+
+  IndexedDB Schema (frego_db, version 3):
+    Object Store: "models"
+      id            : autoincrement integer (primary key)
+      name          : string (unique index)
+      createdAt     : timestamp (ms)
+      trained       : boolean
+      imageCount    : integer
+      threshold     : float32
+      meanEmbedding : float32[128]
+      allEmbeddings : float32[N][128]
+      trainedAt     : timestamp (ms) | null
+      metricVersion : "euclidean_v1" | "needs_retrain"
+
+================================================================================
+  9. EXPORT FORMAT
+================================================================================
+
+  All files are generated in-browser using JSZip + custom NumPy .npy encoder.
+
+  ── {name}_mean_embedding.npy ────────────────────────────────────────────
+  NumPy v1.0 binary format
+  dtype:  float32 (little-endian, '<f4')
+  shape:  (128,)
+  usage:  Fallback matching, cross-system compatibility
+
+  ── {name}_all_embeddings.npy ────────────────────────────────────────────
+  NumPy v1.0 binary format
+  dtype:  float32 (little-endian, '<f4')
+  shape:  (N, 128)   where N = number of valid training faces
+  usage:  Nearest-neighbor matching in Python or other systems
+
+  ── {name}_metadata.json ─────────────────────────────────────────────────
+  {
+    "identity"               : "model_name",
+    "total_images"           : int,
+    "valid_faces"            : int,
+    "embedding_dimension"    : 128,
+    "threshold"              : float,
+    "distance_metric"        : "euclidean",
+    "threshold_interpretation": "dist < threshold → recognized",
+    "all_embeddings_included" : true,
+    "framework"              : "Frego Browser ML v1.0",
+    "model_backbone"         : "faceRecognitionNet (vladmandic/face-api)",
+    "backend"                : "WebGL / TensorFlow.js",
+    "created_at"             : "ISO 8601 timestamp",
+    "trained_at"             : "ISO 8601 timestamp"
+  }
+
+  Python usage:
+    import numpy as np, json
+    all_embs = np.load("name_all_embeddings.npy")   # (N, 128) float32
+    meta     = json.load(open("name_metadata.json"))
+    threshold = meta["threshold"]
+    # Nearest-neighbor in Python:
+    dists = np.linalg.norm(all_embs - query_emb, axis=1)
+    recognized = dists.min() < threshold
+
+================================================================================
+  10. THRESHOLD GUIDELINES & TUNING
+================================================================================
+
+  Euclidean distance ranges for faceRecognitionNet (128D):
+
+    0.00 – 0.20  : Near-identical (same photo, minor augmentation)
+    0.20 – 0.35  : Strong match (good lighting, same person)
+    0.35 – 0.45  : Acceptable match (angle/lighting variation)
+    0.45 – 0.55  : Marginal (may include relatives / same gender)
+    0.55 – 0.70  : Weak match (likely different person)
+    0.70+        : Strong mismatch (clearly different person)
+
+  Recommended threshold range:  0.38 – 0.45
+  Default auto-computed cap:     0.45
+  face-api.js FaceMatcher default: 0.60 (too loose for single-identity use)
+
+  Tuning advice:
+    - If the system rejects your valid face → increase threshold (max 0.50)
+    - If the system recognizes other people → decrease threshold (min 0.30)
+    - Ensure training images cover: different lighting, angles, expressions
+    - Minimum recommended training images: 10 (optimal: 30–100)
+
+================================================================================
+  11. KNOWN LIMITATIONS
+================================================================================
+
+  1. SINGLE IDENTITY PER MODEL
+     Each model is trained on one person. Multi-identity support would require
+     training one model per person and running find-best-match across all of them.
+
+  2. NO FACE ALIGNMENT NORMALIZATION
+     The prototype Python version performs explicit affine alignment using eye
+     landmarks before extracting embeddings. face-api.js performs alignment
+     internally, but it may be less robust under extreme head angles (>45°).
+
+  3. LIGHTING SENSITIVITY
+     Extreme lighting changes (very dark, direct flash) increase intra-class
+     variance. Train with diverse lighting for better robustness.
+
+  4. GLASSES / ACCESSORIES
+     Large glasses or head coverings can significantly increase embedding
+     distance. If the person wears glasses, train with photos wearing glasses.
+
+  5. SESSION-LIMITED EMBEDDINGS (during upload)
+     Images must be processed and training completed within the same browser
+     tab session. Refreshing the page during upload clears session embeddings
+     and requires re-upload. (Trained models persist in IndexedDB.)
+
+  6. MODEL SIZE
+     ML model weights (~6.5 MB compressed) are loaded from CDN on first use
+     and cached by the browser. Requires internet on first load.
+
+  7. NO ANTI-SPOOFING
+     The system does not detect photo or video spoofing attacks (printed photos,
+     screen replay). The Python prototype includes a liveness check via frame
+     difference; this is not yet implemented in the browser version.
+
+================================================================================
+  END OF ALGORITHM DOCUMENTATION
+  Frego v1.0.0  |  github.com/callme-ADHI/Frego
+================================================================================
